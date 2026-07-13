@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-vocab-jetson-tracking"
+version = "0.1.0"
+description = "Open-vocabulary detection with VLMs and BoxMOT tracking on Jetson"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  # v17+ pulls a Hugging Face Hub major that conflicts with the Transformers
+  # version required by LocateAnything; v20+ also requires NumPy 2.2+.
+  "boxmot==15.0.10",
+  "numpy>=1.25,<2.0",
+  "opencv-python-headless>=4.10,<5",
+  "Pillow>=10,<12",
+]
+
+[project.optional-dependencies]
+models = [
+  "accelerate>=1.5,<2",
+  "peft>=0.12,<1",
+  "timm>=1.0.11,<2",
+  "tokenizers==0.22.0",
+  "transformers==4.57.1",
+]
+dev = ["pytest>=8,<9", "ruff>=0.9"]
+
+[project.scripts]
+ovtrack = "open_vocab_track.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
