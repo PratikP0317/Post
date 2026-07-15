@@ -6,7 +6,7 @@ import moondream as md
 
 from flask import Flask, Response, jsonify, render_template_string, request
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoModelForZeroShotObjectDetection, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoProcessor
 
 
 app = Flask(__name__)
@@ -19,7 +19,6 @@ app = Flask(__name__)
 # Choose one:
 # "moondream"
 # "florence"
-# "grounding_dino"
 DETECTOR = "moondream"
 
 DETECTION_PROMPT = "person"
@@ -72,24 +71,7 @@ if DETECTOR == "florence":
   florence_model.eval()
 
 
-# ---------------------------------------------------------------------------
-# Grounding DINO setup
-# ---------------------------------------------------------------------------
-
-grounding_dino_model = None
-grounding_dino_processor = None
-GROUNDING_DINO_MODEL_NAME = "IDEA-Research/grounding-dino-base"
-GROUNDING_DINO_TEXT_THRESHOLD = 0.25
-
-if DETECTOR == "grounding_dino":
-  grounding_dino_processor = AutoProcessor.from_pretrained(GROUNDING_DINO_MODEL_NAME)
-  grounding_dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-    GROUNDING_DINO_MODEL_NAME, torch_dtype=TORCH_DTYPE
-  ).to(DEVICE)
-  grounding_dino_model.eval()
-
-
-if DETECTOR not in ["moondream", "florence", "grounding_dino"]:
+if DETECTOR not in ["moondream", "florence"]:
   raise ValueError(f"Unsupported detector: {DETECTOR}")
 
 
@@ -215,50 +197,6 @@ def florence_detect(frame):
 
 
 # ---------------------------------------------------------------------------
-# Grounding DINO detection
-# ---------------------------------------------------------------------------
-
-def grounding_dino_detect(frame):
-  rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-  pil_image = Image.fromarray(rgb_frame)
-  prompt = DETECTION_PROMPT.strip().lower()
-  prompt = prompt if prompt.endswith(".") else f"{prompt}."
-
-  inputs = grounding_dino_processor(images=pil_image, text=prompt, return_tensors="pt").to(DEVICE)
-  inputs["pixel_values"] = inputs["pixel_values"].to(dtype=TORCH_DTYPE)
-
-  with torch.inference_mode():
-    outputs = grounding_dino_model(**inputs)
-
-  target_sizes = [(pil_image.height, pil_image.width)]
-
-  try:
-    results = grounding_dino_processor.post_process_grounded_object_detection(
-      outputs, threshold=DETECTION_THRESHOLD, text_threshold=GROUNDING_DINO_TEXT_THRESHOLD,
-      target_sizes=target_sizes
-    )
-  except TypeError:
-    # Compatibility with older Transformers releases.
-    results = grounding_dino_processor.post_process_grounded_object_detection(
-      outputs, inputs["input_ids"], box_threshold=DETECTION_THRESHOLD,
-      text_threshold=GROUNDING_DINO_TEXT_THRESHOLD, target_sizes=target_sizes
-    )
-
-  result = results[0]
-  boxes = result.get("boxes", [])
-  scores = result.get("scores", [])
-  labels = result.get("text_labels", result.get("labels", []))
-  detections = []
-
-  for index, (box, score) in enumerate(zip(boxes, scores)):
-    x1, y1, x2, y2 = [int(value) for value in box.tolist()]
-    label = str(labels[index]) if index < len(labels) else DETECTION_PROMPT
-    detections.append((x1, y1, x2, y2, label, float(score.item())))
-
-  return detections
-
-
-# ---------------------------------------------------------------------------
 # Selected detector
 # ---------------------------------------------------------------------------
 
@@ -268,9 +206,6 @@ def run_detection(frame):
 
   if DETECTOR == "florence":
     return florence_detect(frame)
-
-  if DETECTOR == "grounding_dino":
-    return grounding_dino_detect(frame)
 
   return []
 
