@@ -25,10 +25,7 @@ DETECTION_PROMPT = "person"
 VIDEO_PATH = "/MAVIK_dataset/DJI_0042.MP4"
 INTERVAL_N = 30
 
-TRACKER_MODEL_PATH = (
-  "/app/src/moondream/"
-  "object_tracking_vittrack_2023sep.onnx"
-)
+TRACKER_MODEL_PATH = "/app/src/moondream/object_tracking_vittrack_2023sep.onnx"
 
 
 # ---------------------------------------------------------------------------
@@ -41,13 +38,9 @@ if DETECTOR == "moondream":
   api_key = os.environ.get("MOONDREAM_API_KEY")
 
   if not api_key:
-    raise RuntimeError(
-      "MOONDREAM_API_KEY is not set"
-    )
+    raise RuntimeError("MOONDREAM_API_KEY is not set")
 
-  moondream_model = md.vl(
-    api_key=api_key
-  )
+  moondream_model = md.vl(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -57,54 +50,29 @@ if DETECTOR == "moondream":
 florence_model = None
 florence_processor = None
 
-DEVICE = (
-  "cuda:0"
-  if torch.cuda.is_available()
-  else "cpu"
-)
-
-TORCH_DTYPE = (
-  torch.float16
-  if torch.cuda.is_available()
-  else torch.float32
-)
-
-FLORENCE_MODEL_NAME = (
-  "microsoft/Florence-2-base-ft"
-)
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+TORCH_DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
+FLORENCE_MODEL_NAME = "microsoft/Florence-2-base-ft"
 
 if DETECTOR == "florence":
-  florence_processor = AutoProcessor.from_pretrained(
-    FLORENCE_MODEL_NAME,
-    trust_remote_code=True
-  )
+  florence_processor = AutoProcessor.from_pretrained(FLORENCE_MODEL_NAME, trust_remote_code=True)
 
   florence_model = AutoModelForCausalLM.from_pretrained(
-    FLORENCE_MODEL_NAME,
-    torch_dtype=TORCH_DTYPE,
-    trust_remote_code=True
+    FLORENCE_MODEL_NAME, torch_dtype=TORCH_DTYPE, trust_remote_code=True
   ).to(DEVICE)
 
   florence_model.eval()
 
 
 if DETECTOR not in ["moondream", "florence"]:
-  raise ValueError(
-    f"Unsupported detector: {DETECTOR}"
-  )
+  raise ValueError(f"Unsupported detector: {DETECTOR}")
 
 
 # ---------------------------------------------------------------------------
 # Analytics
 # ---------------------------------------------------------------------------
 
-analytics = {
-  "fps": 0.0,
-  "inference_time_ms": 0,
-  "detected_items": 0,
-  "frame_count": 0,
-  "detector": DETECTOR
-}
+analytics = {"fps": 0.0, "inference_time_ms": 0, "detected_items": 0, "frame_count": 0, "detector": DETECTOR}
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +82,7 @@ analytics = {
 cap = cv2.VideoCapture(VIDEO_PATH)
 
 if not cap.isOpened():
-  raise RuntimeError(
-    f"Could not open video: {VIDEO_PATH}"
-  )
+  raise RuntimeError(f"Could not open video: {VIDEO_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -139,17 +105,11 @@ def create_tracker():
 def moondream_detect(frame):
   height, width = frame.shape[:2]
 
-  rgb_frame = cv2.cvtColor(
-    frame,
-    cv2.COLOR_BGR2RGB
-  )
+  rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
   pil_image = Image.fromarray(rgb_frame)
 
-  result = moondream_model.detect(
-    image=pil_image,
-    object=DETECTION_PROMPT
-  )
+  result = moondream_model.detect(image=pil_image, object=DETECTION_PROMPT)
 
   detections = []
 
@@ -159,15 +119,7 @@ def moondream_detect(frame):
     x2 = int(obj["x_max"] * width)
     y2 = int(obj["y_max"] * height)
 
-    detections.append(
-      (
-        x1,
-        y1,
-        x2,
-        y2,
-        DETECTION_PROMPT
-      )
-    )
+    detections.append((x1, y1, x2, y2, DETECTION_PROMPT))
 
   return detections
 
@@ -177,36 +129,17 @@ def moondream_detect(frame):
 # ---------------------------------------------------------------------------
 
 def florence_detect(frame):
-  rgb_frame = cv2.cvtColor(
-    frame,
-    cv2.COLOR_BGR2RGB
-  )
+  rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
   pil_image = Image.fromarray(rgb_frame)
 
-  task_prompt = (
-    "<OPEN_VOCABULARY_DETECTION>"
-  )
+  task_prompt = "<OPEN_VOCABULARY_DETECTION>"
+  prompt = task_prompt + DETECTION_PROMPT
 
-  prompt = (
-    task_prompt
-    + DETECTION_PROMPT
-  )
+  inputs = florence_processor(text=prompt, images=pil_image, return_tensors="pt")
 
-  inputs = florence_processor(
-    text=prompt,
-    images=pil_image,
-    return_tensors="pt"
-  )
-
-  input_ids = inputs["input_ids"].to(
-    DEVICE
-  )
-
-  pixel_values = inputs["pixel_values"].to(
-    DEVICE,
-    dtype=TORCH_DTYPE
-  )
+  input_ids = inputs["input_ids"].to(DEVICE)
+  pixel_values = inputs["pixel_values"].to(DEVICE, dtype=TORCH_DTYPE)
 
   with torch.inference_mode():
     generated_ids = florence_model.generate(
@@ -217,25 +150,13 @@ def florence_detect(frame):
       num_beams=3
     )
 
-  generated_text = (
-    florence_processor.batch_decode(
-      generated_ids,
-      skip_special_tokens=False
-    )[0]
+  generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+  parsed_result = florence_processor.post_process_generation(
+    generated_text, task=task_prompt, image_size=pil_image.size
   )
 
-  parsed_result = (
-    florence_processor.post_process_generation(
-      generated_text,
-      task=task_prompt,
-      image_size=pil_image.size
-    )
-  )
-
-  result = parsed_result.get(
-    task_prompt,
-    {}
-  )
+  result = parsed_result.get(task_prompt, {})
 
   boxes = result.get("bboxes", [])
   labels = result.get("labels", [])
@@ -253,15 +174,7 @@ def florence_detect(frame):
     if index < len(labels):
       label = labels[index]
 
-    detections.append(
-      (
-        x1,
-        y1,
-        x2,
-        y2,
-        label
-      )
-    )
+    detections.append((x1, y1, x2, y2, label))
 
   return detections
 
@@ -284,32 +197,13 @@ def run_detection(frame):
 # Coordinate validation
 # ---------------------------------------------------------------------------
 
-def clamp_bbox(
-  bbox,
-  frame_width,
-  frame_height
-):
+def clamp_bbox(bbox, frame_width, frame_height):
   x1, y1, x2, y2 = bbox
 
-  x1 = max(
-    0,
-    min(x1, frame_width - 1)
-  )
-
-  y1 = max(
-    0,
-    min(y1, frame_height - 1)
-  )
-
-  x2 = max(
-    0,
-    min(x2, frame_width - 1)
-  )
-
-  y2 = max(
-    0,
-    min(y2, frame_height - 1)
-  )
+  x1 = max(0, min(x1, frame_width - 1))
+  y1 = max(0, min(y1, frame_height - 1))
+  x2 = max(0, min(x2, frame_width - 1))
+  y2 = max(0, min(y2, frame_height - 1))
 
   return x1, y1, x2, y2
 
@@ -332,10 +226,7 @@ def generate():
     success, frame = cap.read()
 
     if not success:
-      cap.set(
-        cv2.CAP_PROP_POS_FRAMES,
-        0
-      )
+      cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
       local_frame_count = 0
       tracker_initialized = False
@@ -344,22 +235,13 @@ def generate():
 
       continue
 
-    frame = cv2.resize(
-      frame,
-      (854, 480),
-      interpolation=cv2.INTER_AREA
-    )
-
-    frame_height, frame_width = (
-      frame.shape[:2]
-    )
+    frame = cv2.resize(frame, (854, 480), interpolation=cv2.INTER_AREA)
+    frame_height, frame_width = frame.shape[:2]
 
     annotated = frame.copy()
 
     # Only trigger detector every N frames
-    run_vlm_detection = (
-      local_frame_count % INTERVAL_N == 0
-    )
+    run_vlm_detection = local_frame_count % INTERVAL_N == 0
 
     if run_vlm_detection:
       inference_start = time.time()
@@ -369,63 +251,29 @@ def generate():
 
         if detections:
           # Use the first detection
-          x1, y1, x2, y2, label = (
-            detections[0]
-          )
+          x1, y1, x2, y2, label = detections[0]
 
-          x1, y1, x2, y2 = clamp_bbox(
-            (x1, y1, x2, y2),
-            frame_width,
-            frame_height
-          )
+          x1, y1, x2, y2 = clamp_bbox((x1, y1, x2, y2), frame_width, frame_height)
 
           tracker_width = x2 - x1
           tracker_height = y2 - y1
 
-          if (
-            tracker_width > 0
-            and tracker_height > 0
-          ):
-            tracker_bbox = (
-              x1,
-              y1,
-              tracker_width,
-              tracker_height
-            )
+          if tracker_width > 0 and tracker_height > 0:
+            tracker_bbox = (x1, y1, tracker_width, tracker_height)
 
             # Start a fresh TrackerVit using
             # the latest detector box
             object_tracker = create_tracker()
 
-            object_tracker.init(
-              frame,
-              tracker_bbox
-            )
+            object_tracker.init(frame, tracker_bbox)
 
             tracker_initialized = True
             item_count = 1
 
             # Green box for detector frames
-            cv2.rectangle(
-              annotated,
-              (x1, y1),
-              (x2, y2),
-              (0, 255, 0),
-              3
-            )
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
-            cv2.putText(
-              annotated,
-              f"{DETECTOR}: {label}",
-              (
-                x1,
-                max(y1 - 10, 20)
-              ),
-              cv2.FONT_HERSHEY_SIMPLEX,
-              0.5,
-              (0, 255, 0),
-              2
-            )
+            cv2.putText(annotated, f"{DETECTOR}: {label}", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
           else:
             item_count = 0
@@ -436,19 +284,10 @@ def generate():
           # Keep the existing tracker active if
           # the detector temporarily misses.
 
-        analytics["inference_time_ms"] = int(
-          (
-            time.time()
-            - inference_start
-          )
-          * 1000
-        )
+        analytics["inference_time_ms"] = int((time.time() - inference_start) * 1000)
 
       except Exception as error:
-        print(
-          f"{DETECTOR} inference error: "
-          f"{error}"
-        )
+        print(f"{DETECTOR} inference error: {error}")
 
         analytics["inference_time_ms"] = 0
 
@@ -456,62 +295,21 @@ def generate():
     # TrackerVit step
     # -----------------------------------------------------------------------
 
-    if (
-      tracker_initialized
-      and object_tracker is not None
-      and not run_vlm_detection
-    ):
-      tracking_success, bbox = (
-        object_tracker.update(frame)
-      )
+    if tracker_initialized and object_tracker is not None and not run_vlm_detection:
+      tracking_success, bbox = object_tracker.update(frame)
 
       if tracking_success:
-        x, y, width, height = [
-          int(value)
-          for value in bbox
-        ]
+        x, y, width, height = [int(value) for value in bbox]
 
         item_count = 1
 
         # Blue box for TrackerVit frames
-        cv2.rectangle(
-          annotated,
-          (x, y),
-          (
-            x + width,
-            y + height
-          ),
-          (255, 0, 0),
-          2
-        )
+        cv2.rectangle(annotated, (x, y), (x + width, y + height), (255, 0, 0), 2)
 
-        cv2.putText(
-          annotated,
-          (
-            "TrackerVit "
-            f"(Frame +"
-            f"{local_frame_count % INTERVAL_N})"
-          ),
-          (
-            x,
-            max(y - 10, 20)
-          ),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.5,
-          (255, 0, 0),
-          2
-        )
+        cv2.putText(annotated, f"TrackerVit (Frame +{local_frame_count % INTERVAL_N})", (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
       else:
-        cv2.putText(
-          annotated,
-          "Tracker Lost Target",
-          (20, 40),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.7,
-          (0, 0, 255),
-          2
-        )
+        cv2.putText(annotated, "Tracker Lost Target", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         item_count = 0
 
@@ -519,28 +317,16 @@ def generate():
     local_frame_count += 1
     analytics["frame_count"] += 1
 
-    total_frame_time = (
-      time.time() - start_time
-    )
+    total_frame_time = time.time() - start_time
 
     if total_frame_time > 0:
-      analytics["fps"] = round(
-        1.0 / total_frame_time,
-        1
-      )
+      analytics["fps"] = round(1.0 / total_frame_time, 1)
     else:
       analytics["fps"] = 0.0
 
-    analytics["detected_items"] = (
-      item_count
-    )
+    analytics["detected_items"] = item_count
 
-    encode_success, buffer = (
-      cv2.imencode(
-        ".jpg",
-        annotated
-      )
-    )
+    encode_success, buffer = cv2.imencode(".jpg", annotated)
 
     if not encode_success:
       continue
@@ -566,9 +352,7 @@ def index():
   <html lang="en">
 
   <head>
-    <title>
-      Open Vocabulary Detection + TrackerVit
-    </title>
+    <title>Open Vocabulary Detection + TrackerVit</title>
 
     <style>
       body {
@@ -652,97 +436,46 @@ def index():
   <body>
     <div class="container">
       <header>
-        <h1>
-          Open Vocabulary Detection + TrackerVit
-        </h1>
+        <h1>Open Vocabulary Detection + TrackerVit</h1>
 
         <p>
-          Detector:
-          <span style="color:#38bdf8;">
-            {{ detector }}
-          </span>
-
-          | Prompt:
-          <span style="color:#fbbf24;">
-            {{ detection_prompt }}
-          </span>
-
-          | Status:
-          <span style="color:#4ade80;">
-            Active
-          </span>
+          Detector: <span style="color:#38bdf8;">{{ detector }}</span> |
+          Prompt: <span style="color:#fbbf24;">{{ detection_prompt }}</span> |
+          Status: <span style="color:#4ade80;">Active</span>
         </p>
       </header>
 
       <div class="video-box">
-        <img
-          src="/video"
-          alt="Processed Video Feed"
-        >
+        <img src="/video" alt="Processed Video Feed">
       </div>
 
       <div class="analytics-card">
         <div class="metric">
-          <div class="metric-title">
-            Performance Speed
-          </div>
+          <div class="metric-title">Performance Speed</div>
 
           <div class="metric-value">
             <span id="fps">0.0</span>
-
-            <span style="
-              font-size:1rem;
-              font-weight:normal;
-              color:#64748b;
-            ">
-              FPS
-            </span>
+            <span style="font-size:1rem; font-weight:normal; color:#64748b;">FPS</span>
           </div>
         </div>
 
         <div class="metric">
-          <div class="metric-title">
-            Detector Latency
-          </div>
+          <div class="metric-title">Detector Latency</div>
 
           <div class="metric-value">
             <span id="latency">0</span>
-
-            <span style="
-              font-size:1rem;
-              font-weight:normal;
-              color:#64748b;
-            ">
-              ms
-            </span>
+            <span style="font-size:1rem; font-weight:normal; color:#64748b;">ms</span>
           </div>
         </div>
 
         <div class="metric">
-          <div class="metric-title">
-            Active Targets Present
-          </div>
-
-          <div
-            class="metric-value"
-            id="targets"
-            style="color:#fbbf24;"
-          >
-            0
-          </div>
+          <div class="metric-title">Active Targets Present</div>
+          <div class="metric-value" id="targets" style="color:#fbbf24;">0</div>
         </div>
 
         <div class="metric">
-          <div class="metric-title">
-            Frames Processed
-          </div>
-
-          <div
-            class="metric-value"
-            id="frames"
-          >
-            0
-          </div>
+          <div class="metric-title">Frames Processed</div>
+          <div class="metric-value" id="frames">0</div>
         </div>
       </div>
     </div>
@@ -750,36 +483,17 @@ def index():
     <script>
       setInterval(async () => {
         try {
-          const response = await fetch(
-            "/stats"
-          );
+          const response = await fetch("/stats");
 
           const data = await response.json();
 
-          document.getElementById(
-            "fps"
-          ).innerText = data.fps;
-
-          document.getElementById(
-            "latency"
-          ).innerText =
-            data.inference_time_ms;
-
-          document.getElementById(
-            "targets"
-          ).innerText =
-            data.detected_items;
-
-          document.getElementById(
-            "frames"
-          ).innerText =
-            data.frame_count;
+          document.getElementById("fps").innerText = data.fps;
+          document.getElementById("latency").innerText = data.inference_time_ms;
+          document.getElementById("targets").innerText = data.detected_items;
+          document.getElementById("frames").innerText = data.frame_count;
 
         } catch (error) {
-          console.error(
-            "Telemetry error:",
-            error
-          );
+          console.error("Telemetry error:", error);
         }
       }, 150);
     </script>
@@ -788,11 +502,7 @@ def index():
   </html>
   """
 
-  return render_template_string(
-    html_page,
-    detector=DETECTOR,
-    detection_prompt=DETECTION_PROMPT
-  )
+  return render_template_string(html_page, detector=DETECTOR, detection_prompt=DETECTION_PROMPT)
 
 
 @app.route("/stats")
@@ -802,18 +512,8 @@ def stats():
 
 @app.route("/video")
 def video():
-  return Response(
-    generate(),
-    mimetype=(
-      "multipart/x-mixed-replace; "
-      "boundary=frame"
-    )
-  )
+  return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 if __name__ == "__main__":
-  app.run(
-    host="0.0.0.0",
-    port=1516,
-    debug=False
-  )
+  app.run(host="0.0.0.0", port=1516, debug=False)
