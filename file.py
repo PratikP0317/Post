@@ -4,7 +4,7 @@ import time
 import torch
 import moondream as md
 
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor
 
@@ -22,6 +22,7 @@ app = Flask(__name__)
 DETECTOR = "moondream"
 
 DETECTION_PROMPT = "person"
+prompt_revision = 0
 DETECTION_THRESHOLD = 0.3
 TRACKER_SCORE_THRESHOLD = 0.1
 TRACK_ASSOCIATION_IOU_THRESHOLD = 0.1
@@ -78,8 +79,7 @@ if DETECTOR not in ["moondream", "florence"]:
 analytics = {
   "fps": 0.0, "inference_time_ms": 0, "detected_items": 0, "frame_count": 0, "detector": DETECTOR,
   "detector_confidence_available": None, "detector_confidence": None,
-  "detector_threshold": DETECTION_THRESHOLD, "tracker_confidence": None,
-  "tracker_threshold": TRACKER_SCORE_THRESHOLD, "tracker_status": "Waiting"
+  "detector_threshold": DETECTION_THRESHOLD, "detection_prompt": DETECTION_PROMPT
 }
 
 
@@ -244,6 +244,7 @@ def generate():
   global analytics
 
   local_frame_count = 0
+  local_prompt_revision = prompt_revision
   tracker_initialized = False
   object_tracker = None
   last_tracker_bbox = None
@@ -272,8 +273,19 @@ def generate():
 
     annotated = frame.copy()
 
-    # Only trigger detector every N frames
-    run_vlm_detection = local_frame_count % INTERVAL_N == 0
+    prompt_changed = local_prompt_revision != prompt_revision
+
+    if prompt_changed:
+      local_prompt_revision = prompt_revision
+      tracker_initialized = False
+      object_tracker = None
+      last_tracker_bbox = None
+      secondary_detections = []
+      analytics["detector_confidence_available"] = None
+      analytics["detector_confidence"] = None
+
+    # Trigger immediately for a new prompt, otherwise every N frames.
+    run_vlm_detection = prompt_changed or local_frame_count % INTERVAL_N == 0
 
     if run_vlm_detection:
       inference_start = time.time()
@@ -322,14 +334,12 @@ def generate():
             tracker_initialized = True
             last_tracker_bbox = (x1, y1, x2, y2)
             analytics["detector_confidence"] = score
-            analytics["tracker_status"] = "Tracking (score not exposed)"
 
             score_text = f" {score:.2f}" if score is not None else ""
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
             cv2.putText(annotated, f"{DETECTOR}: {label}{score_text}", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
           else:
             analytics["detector_confidence"] = None
-            analytics["tracker_status"] = "No matching detection; keeping tracker"
 
         else:
           item_count = 0
@@ -365,7 +375,6 @@ def generate():
 
         last_tracker_bbox = (x, y, x + width, y + height)
         item_count = 1 + len(secondary_detections)
-        analytics["tracker_status"] = "Tracking (score not exposed)"
 
         # Blue box for TrackerVit frames
         cv2.rectangle(annotated, (x, y), (x + width, y + height), (255, 0, 0), 2)
@@ -379,7 +388,6 @@ def generate():
         object_tracker = None
         last_tracker_bbox = None
         item_count = 0
-        analytics["tracker_status"] = "Lost"
 
     # Increment counters
     local_frame_count += 1
@@ -498,6 +506,7 @@ def index():
         font-weight: bold;
         color: #38bdf8;
       }
+
     </style>
   </head>
 
@@ -508,7 +517,7 @@ def index():
 
         <p>
           Detector: <span style="color:#38bdf8;">{{ detector }}</span> |
-          Prompt: <span style="color:#fbbf24;">{{ detection_prompt }}</span> |
+          Prompt: <span id="current-prompt" style="color:#fbbf24;">{{ detection_prompt }}</span> |
           Status: <span style="color:#4ade80;">Active</span>
         </p>
       </header>
@@ -518,6 +527,15 @@ def index():
       </div>
 
       <div class="analytics-card">
+        <form class="metric" id="prompt-form">
+          <div class="metric-title">Detection Prompt</div>
+          <div style="display:flex; gap:6px;">
+            <input id="prompt-input" value="{{ detection_prompt }}" maxlength="200" required style="min-width:0; flex:1;">
+            <button type="submit">Run</button>
+          </div>
+          <small id="prompt-status" style="color:#94a3b8;"></small>
+        </form>
+
         <div class="metric">
           <div class="metric-title">Performance Speed</div>
 
@@ -543,12 +561,6 @@ def index():
         </div>
 
         <div class="metric">
-          <div class="metric-title">Tracker Confidence</div>
-          <div class="metric-value" id="tracker-confidence" style="font-size:1.3rem;">N/A</div>
-          <div id="tracker-confidence-note" style="font-size:0.75rem; color:#94a3b8; margin-top:5px;">Waiting</div>
-        </div>
-
-        <div class="metric">
           <div class="metric-title">Active Targets Present</div>
           <div class="metric-value" id="targets" style="color:#fbbf24;">0</div>
         </div>
@@ -561,6 +573,24 @@ def index():
     </div>
 
     <script>
+      document.getElementById("prompt-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const input = document.getElementById("prompt-input");
+        const status = document.getElementById("prompt-status");
+        const prompt = input.value.trim();
+        if (!prompt) return;
+
+        try {
+          const response = await fetch("/prompt", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({prompt})});
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || "Could not update prompt");
+          document.getElementById("current-prompt").innerText = data.prompt;
+          status.innerText = " Updated";
+        } catch (error) {
+          status.innerText = error.message;
+        }
+      });
+
       setInterval(async () => {
         try {
           const response = await fetch("/stats");
@@ -586,9 +616,6 @@ def index():
             detectorNote.innerText = `Configured threshold: ${data.detector_threshold.toFixed(2)}`;
           }
 
-          document.getElementById("tracker-confidence").innerText = data.tracker_confidence === null ? "Not exposed" : data.tracker_confidence.toFixed(2);
-          document.getElementById("tracker-confidence-note").innerText = `${data.tracker_status}; internal threshold: ${data.tracker_threshold.toFixed(2)}`;
-
         } catch (error) {
           console.error("Telemetry error:", error);
         }
@@ -600,6 +627,23 @@ def index():
   """
 
   return render_template_string(html_page, detector=DETECTOR, detection_prompt=DETECTION_PROMPT)
+
+
+@app.route("/prompt", methods=["POST"])
+def update_prompt():
+  global DETECTION_PROMPT, prompt_revision
+
+  data = request.get_json(silent=True) or {}
+  new_prompt = str(data.get("prompt", "")).strip()
+
+  if not 1 <= len(new_prompt) <= 200:
+    return jsonify({"error": "Prompt must be between 1 and 200 characters"}), 400
+
+  DETECTION_PROMPT = new_prompt
+  prompt_revision += 1
+  analytics["detection_prompt"] = DETECTION_PROMPT
+
+  return jsonify({"prompt": DETECTION_PROMPT})
 
 
 @app.route("/stats")
