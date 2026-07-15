@@ -6,7 +6,7 @@ import moondream as md
 
 from flask import Flask, Response, jsonify, render_template_string, request
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoModelForZeroShotObjectDetection, AutoProcessor
 
 
 app = Flask(__name__)
@@ -19,6 +19,7 @@ app = Flask(__name__)
 # Choose one:
 # "moondream"
 # "florence"
+# "llmdet"
 DETECTOR = "moondream"
 
 DETECTION_PROMPT = "person"
@@ -71,7 +72,23 @@ if DETECTOR == "florence":
   florence_model.eval()
 
 
-if DETECTOR not in ["moondream", "florence"]:
+# ---------------------------------------------------------------------------
+# LLMDet setup
+# ---------------------------------------------------------------------------
+
+llmdet_model = None
+llmdet_processor = None
+LLMDET_MODEL_NAME = "iSEE-Laboratory/llmdet_tiny"
+
+if DETECTOR == "llmdet":
+  llmdet_processor = AutoProcessor.from_pretrained(LLMDET_MODEL_NAME)
+  llmdet_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+    LLMDET_MODEL_NAME, torch_dtype=TORCH_DTYPE
+  ).to(DEVICE)
+  llmdet_model.eval()
+
+
+if DETECTOR not in ["moondream", "florence", "llmdet"]:
   raise ValueError(f"Unsupported detector: {DETECTOR}")
 
 
@@ -197,6 +214,38 @@ def florence_detect(frame):
 
 
 # ---------------------------------------------------------------------------
+# LLMDet detection
+# ---------------------------------------------------------------------------
+
+def llmdet_detect(frame):
+  rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+  pil_image = Image.fromarray(rgb_frame)
+  text_labels = [[DETECTION_PROMPT]]
+
+  inputs = llmdet_processor(images=pil_image, text=text_labels, return_tensors="pt").to(DEVICE)
+  inputs["pixel_values"] = inputs["pixel_values"].to(dtype=TORCH_DTYPE)
+
+  with torch.inference_mode():
+    outputs = llmdet_model(**inputs)
+
+  result = llmdet_processor.post_process_grounded_object_detection(
+    outputs, threshold=DETECTION_THRESHOLD, target_sizes=[(pil_image.height, pil_image.width)]
+  )[0]
+
+  boxes = result.get("boxes", [])
+  scores = result.get("scores", [])
+  labels = result.get("labels", [])
+  detections = []
+
+  for index, (box, score) in enumerate(zip(boxes, scores)):
+    x1, y1, x2, y2 = [int(value) for value in box.tolist()]
+    label = str(labels[index]) if index < len(labels) else DETECTION_PROMPT
+    detections.append((x1, y1, x2, y2, label, float(score.item())))
+
+  return detections
+
+
+# ---------------------------------------------------------------------------
 # Selected detector
 # ---------------------------------------------------------------------------
 
@@ -206,6 +255,9 @@ def run_detection(frame):
 
   if DETECTOR == "florence":
     return florence_detect(frame)
+
+  if DETECTOR == "llmdet":
+    return llmdet_detect(frame)
 
   return []
 
