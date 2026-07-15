@@ -22,6 +22,7 @@ app = Flask(__name__)
 DETECTOR = "moondream"
 
 DETECTION_PROMPT = "person"
+DETECTION_THRESHOLD = 0.3
 VIDEO_PATH = "/MAVIK_dataset/DJI_0042.MP4"
 INTERVAL_N = 30
 
@@ -118,8 +119,11 @@ def moondream_detect(frame):
     y1 = int(obj["y_min"] * height)
     x2 = int(obj["x_max"] * width)
     y2 = int(obj["y_max"] * height)
+    score = obj.get("score", obj.get("confidence"))
+    score = float(score) if score is not None else None
 
-    detections.append((x1, y1, x2, y2, DETECTION_PROMPT))
+    if score is None or score >= DETECTION_THRESHOLD:
+      detections.append((x1, y1, x2, y2, DETECTION_PROMPT, score))
 
   return detections
 
@@ -160,6 +164,7 @@ def florence_detect(frame):
 
   boxes = result.get("bboxes", [])
   labels = result.get("labels", [])
+  scores = result.get("scores", [])
 
   detections = []
 
@@ -170,11 +175,13 @@ def florence_detect(frame):
     y2 = int(box[3])
 
     label = DETECTION_PROMPT
+    score = float(scores[index]) if index < len(scores) else None
 
     if index < len(labels):
       label = labels[index]
 
-    detections.append((x1, y1, x2, y2, label))
+    if score is None or score >= DETECTION_THRESHOLD:
+      detections.append((x1, y1, x2, y2, label, score))
 
   return detections
 
@@ -249,34 +256,38 @@ def generate():
       try:
         detections = run_detection(frame)
 
-        if detections:
-          # Use the first detection
-          x1, y1, x2, y2, label = detections[0]
+        valid_detections = []
 
+        for x1, y1, x2, y2, label, score in detections:
           x1, y1, x2, y2 = clamp_bbox((x1, y1, x2, y2), frame_width, frame_height)
 
-          tracker_width = x2 - x1
-          tracker_height = y2 - y1
+          if x2 > x1 and y2 > y1:
+            valid_detections.append((x1, y1, x2, y2, label, score))
 
-          if tracker_width > 0 and tracker_height > 0:
-            tracker_bbox = (x1, y1, tracker_width, tracker_height)
+        if valid_detections:
+          scored_detections = [(index, detection) for index, detection in enumerate(valid_detections) if detection[5] is not None]
+          primary_index = max(scored_detections, key=lambda item: item[1][5])[0] if scored_detections else 0
 
-            # Start a fresh TrackerVit using
-            # the latest detector box
-            object_tracker = create_tracker()
+          # Draw every non-primary detection in gray.
+          for index, (x1, y1, x2, y2, label, score) in enumerate(valid_detections):
+            if index == primary_index:
+              continue
 
-            object_tracker.init(frame, tracker_bbox)
+            score_text = f" {score:.2f}" if score is not None else ""
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (140, 140, 140), 2)
+            cv2.putText(annotated, f"{label}{score_text}", (x1, max(y1 - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
-            tracker_initialized = True
-            item_count = 1
+          # Track the highest-confidence detection, or the first when no scores exist.
+          x1, y1, x2, y2, label, score = valid_detections[primary_index]
+          tracker_bbox = (x1, y1, x2 - x1, y2 - y1)
+          object_tracker = create_tracker()
+          object_tracker.init(frame, tracker_bbox)
+          tracker_initialized = True
+          item_count = len(valid_detections)
 
-            # Green box for detector frames
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
-
-            cv2.putText(annotated, f"{DETECTOR}: {label}", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-          else:
-            item_count = 0
+          score_text = f" {score:.2f}" if score is not None else ""
+          cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
+          cv2.putText(annotated, f"{DETECTOR}: {label}{score_text}", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         else:
           item_count = 0
