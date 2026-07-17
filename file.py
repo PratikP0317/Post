@@ -349,8 +349,7 @@ def verify_bbox(frame, bbox, target_prompt):
       }
     ],
     "temperature": 0.0,
-    "max_tokens": 32,
-    "chat_template_kwargs": {"enable_thinking": False}
+    "max_tokens": 32
   }
   api_request = Request(
     BBOX_VERIFIER_URL,
