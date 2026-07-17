@@ -260,13 +260,11 @@ class LLMDetDetector(DetectorModel):
     if self.model is None or self.processor is None or self.torch is None:
       raise RuntimeError("LLMDetDetector.load_model() must be called before predict()")
 
-    inputs = self.processor(images=image, text=[[prompt]], return_tensors="pt").to(self.device)
-
-    if "pixel_values" in inputs:
-      inputs["pixel_values"] = inputs["pixel_values"].to(dtype=self.dtype)
+    inputs = self.processor(images=image, text=prompt, return_tensors="pt").to(self.device)
 
     with self.torch.inference_mode():
-      outputs = self.model(**inputs)
+      with self.torch.amp.autocast(device_type="cuda", dtype=self.dtype):
+        outputs = self.model(**inputs)
 
     result = self.processor.post_process_grounded_object_detection(
       outputs, threshold=self.threshold, target_sizes=[(image.height, image.width)]

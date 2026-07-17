@@ -236,10 +236,10 @@ def llmdet_detect(frame):
   text_labels = [[DETECTION_PROMPT]]
 
   inputs = llmdet_processor(images=pil_image, text=text_labels, return_tensors="pt").to(DEVICE)
-  inputs["pixel_values"] = inputs["pixel_values"].to(dtype=TORCH_DTYPE)
 
   with torch.inference_mode():
-    outputs = llmdet_model(**inputs)
+    with torch.amp.autocast(device_type="cuda", dtype=TORCH_DTYPE):
+      outputs = llmdet_model(**inputs)
 
   result = llmdet_processor.post_process_grounded_object_detection(
     outputs, threshold=DETECTION_THRESHOLD, target_sizes=[(pil_image.height, pil_image.width)]
