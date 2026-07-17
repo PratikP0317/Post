@@ -1,6 +1,10 @@
+import base64
+import json
 import os
-import cv2
 import time
+from urllib.request import Request, urlopen
+
+import cv2
 import torch
 import moondream as md
 
@@ -34,6 +38,15 @@ VIDEO_PATH = "/MAVIK_dataset/DJI_0042.MP4"
 INTERVAL_N = 30
 
 TRACKER_MODEL_PATH = "/app/src/moondream/object_tracking_vittrack_2023sep.onnx"
+
+BBOX_VERIFIER_ENABLED = os.environ.get(
+  "BBOX_VERIFIER_ENABLED", "true"
+).lower() in {"1", "true", "yes", "on"}
+BBOX_VERIFIER_URL = os.environ.get(
+  "BBOX_VERIFIER_URL", "http://localhost:3214/v1/chat/completions"
+)
+BBOX_VERIFIER_MODEL = os.environ.get("BBOX_VERIFIER_MODEL", "Qwen/Qwen3.5-2B")
+BBOX_VERIFIER_TIMEOUT_SECONDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +305,87 @@ def bbox_iou(first, second):
 
 
 # ---------------------------------------------------------------------------
+# Bounding-box verification
+# ---------------------------------------------------------------------------
+
+def verify_bbox(frame, bbox, target_prompt):
+  if not BBOX_VERIFIER_ENABLED:
+    return True
+
+  x1, y1, x2, y2 = bbox
+  crop = frame[y1:y2, x1:x2]
+
+  if crop.size == 0:
+    return False
+
+  encode_success, encoded_crop = cv2.imencode(".jpg", crop)
+
+  if not encode_success:
+    return False
+
+  image_data = base64.b64encode(encoded_crop.tobytes()).decode("ascii")
+  system_prompt = (
+    "You are a strict second-stage verifier for an object detector in a video tracking system. "
+    "The user provides a cropped candidate bounding box and the target description used by the "
+    "detector. Decide whether the crop visibly contains an object matching that description. "
+    "The crop may be tight or show only part of the object, so accept a partial view when enough "
+    "visual evidence is present. Reject the candidate when the target is absent, conflicting "
+    "attributes are visible, or the crop is too ambiguous. Respond with exactly one JSON object "
+    "and no other text: {\"matches\": true} or {\"matches\": false}."
+  )
+  payload = {
+    "model": BBOX_VERIFIER_MODEL,
+    "messages": [
+      {"role": "system", "content": system_prompt},
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": f"Target description: {target_prompt}"},
+          {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}
+          }
+        ]
+      }
+    ],
+    "temperature": 0.0,
+    "max_tokens": 32,
+    "chat_template_kwargs": {"enable_thinking": False}
+  }
+  api_request = Request(
+    BBOX_VERIFIER_URL,
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST"
+  )
+
+  try:
+    with urlopen(api_request, timeout=BBOX_VERIFIER_TIMEOUT_SECONDS) as response:
+      result = json.loads(response.read().decode("utf-8"))
+
+    content = result["choices"][0]["message"]["content"]
+
+    if isinstance(content, list):
+      content = "".join(
+        part.get("text", "") for part in content if isinstance(part, dict)
+      )
+
+    content = content.strip()
+    json_start = content.find("{")
+    json_end = content.rfind("}")
+
+    if json_start == -1 or json_end < json_start:
+      raise ValueError(f"Verifier returned invalid JSON: {content!r}")
+
+    verdict = json.loads(content[json_start:json_end + 1])
+    return verdict.get("matches") is True
+
+  except Exception as error:
+    print(f"Bounding-box verifier error: {error}")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Video processing
 # ---------------------------------------------------------------------------
 
@@ -343,26 +437,47 @@ def generate():
     run_vlm_detection = prompt_changed or local_frame_count % INTERVAL_N == 0
 
     if run_vlm_detection:
+      previous_tracker_bbox = last_tracker_bbox if tracker_initialized else None
+
+      # Do not carry a tracker across detector intervals. A fresh detection
+      # below must initialize a new tracker for tracking to continue.
+      tracker_initialized = False
+      object_tracker = None
+      last_tracker_bbox = None
+      secondary_detections = []
+      item_count = 0
+
       inference_start = time.time()
 
       try:
         detections = run_detection(frame)
 
         valid_detections = []
+        rejected_detections = []
 
         for x1, y1, x2, y2, label, score in detections:
           x1, y1, x2, y2 = clamp_bbox((x1, y1, x2, y2), frame_width, frame_height)
 
           if x2 > x1 and y2 > y1:
-            valid_detections.append((x1, y1, x2, y2, label, score))
+            detection = (x1, y1, x2, y2, label, score)
+
+            if verify_bbox(frame, (x1, y1, x2, y2), DETECTION_PROMPT):
+              valid_detections.append(detection)
+            else:
+              rejected_detections.append(detection)
+
+        for x1, y1, x2, y2, label, score in rejected_detections:
+          score_text = f" {score:.2f}" if score is not None else ""
+          cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
+          cv2.putText(annotated, f"Rejected: {label}{score_text}", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         if valid_detections:
           analytics["detector_confidence_available"] = any(detection[5] is not None for detection in valid_detections)
           scored_detections = [(index, detection) for index, detection in enumerate(valid_detections) if detection[5] is not None]
           primary_index = None
 
-          if USE_IOU_TARGET_ASSOCIATION and tracker_initialized and last_tracker_bbox is not None:
-            overlaps = [bbox_iou(last_tracker_bbox, detection[:4]) for detection in valid_detections]
+          if USE_IOU_TARGET_ASSOCIATION and previous_tracker_bbox is not None:
+            overlaps = [bbox_iou(previous_tracker_bbox, detection[:4]) for detection in valid_detections]
             best_overlap = max(overlaps)
 
             if best_overlap >= TRACK_ASSOCIATION_IOU_THRESHOLD:
@@ -400,9 +515,6 @@ def generate():
           item_count = 0
           secondary_detections = []
           analytics["detector_confidence"] = None
-
-          # Keep the existing tracker active if
-          # the detector temporarily misses.
 
         analytics["inference_time_ms"] = int((time.time() - inference_start) * 1000)
 
