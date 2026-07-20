@@ -10,7 +10,6 @@ independent from dataset evaluation.
 
 from __future__ import annotations
 
-import base64
 import csv
 import json
 import math
@@ -19,11 +18,8 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 
 from benchmark_models import Detection, create_detector, sanitize_detections
 
@@ -31,15 +27,6 @@ from benchmark_models import Detection, create_detector, sanitize_detections
 # ---------------------------------------------------------------------------
 # Configuration -- edit this object to run a benchmark
 # ---------------------------------------------------------------------------
-
-@dataclass
-class VerifierConfig:
-  enabled: bool = False
-  url: str = "http://localhost:3214/v1/chat/completions"
-  model: str = "/model/model_weights"
-  timeout_seconds: float = 15.0
-  fail_closed: bool = True
-
 
 @dataclass
 class BenchmarkConfig:
@@ -74,8 +61,6 @@ class BenchmarkConfig:
   iou_threshold: float = 0.5
   warmup_samples: int = 3
   continue_on_error: bool = True
-  verifier: VerifierConfig = field(default_factory=VerifierConfig)
-
   save_failure_visuals: bool = True
   max_failure_visuals: int = 100
   run_name: str | None = None
@@ -86,7 +71,7 @@ CONFIG = BenchmarkConfig()
 
 
 # ---------------------------------------------------------------------------
-# Dataset and verification records
+# Dataset records
 # ---------------------------------------------------------------------------
 
 Box = tuple[float, float, float, float]
@@ -99,89 +84,6 @@ class RefDroneSample:
   image_path: Path
   prompt: str
   gt_boxes: tuple[Box, ...]
-
-
-@dataclass(frozen=True)
-class VerificationResult:
-  matches: bool
-  error: str | None = None
-
-
-class QwenBBoxVerifier:
-  def __init__(self, config: VerifierConfig):
-    self.config = config
-
-  def verify(self, image: Any, bbox: Box, prompt: str) -> VerificationResult:
-    x1, y1, x2, y2 = (int(round(value)) for value in bbox)
-    crop = image.crop((x1, y1, x2, y2))
-
-    if crop.width <= 0 or crop.height <= 0:
-      return VerificationResult(False, "empty bounding-box crop")
-
-    image_buffer = BytesIO()
-    crop.save(image_buffer, format="JPEG")
-    image_data = base64.b64encode(image_buffer.getvalue()).decode("ascii")
-    system_prompt = (
-      "You are a strict second-stage verifier for an object detector in a drone-image grounding "
-      "benchmark. The user provides a candidate bounding-box crop and a referring expression. "
-      "Decide whether the crop visibly contains an object matching that expression. A tight or "
-      "partial crop may be accepted when enough visual evidence is present. Reject absent, "
-      "conflicting, or ambiguous targets. Respond with exactly {\"matches\": true} or "
-      "{\"matches\": false} and no other text."
-    )
-    payload = {
-      "model": self.config.model,
-      "messages": [
-        {"role": "system", "content": system_prompt},
-        {
-          "role": "user",
-          "content": [
-            {"type": "text", "text": f"Referring expression: {prompt}"},
-            {
-              "type": "image_url",
-              "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
-            },
-          ],
-        },
-      ],
-      "temperature": 0.0,
-      "max_tokens": 32,
-    }
-    request = Request(
-      self.config.url,
-      data=json.dumps(payload).encode("utf-8"),
-      headers={"Content-Type": "application/json"},
-      method="POST",
-    )
-
-    try:
-      with urlopen(request, timeout=self.config.timeout_seconds) as response:
-        result = json.loads(response.read().decode("utf-8"))
-
-      content = result["choices"][0]["message"]["content"]
-
-      if isinstance(content, list):
-        content = "".join(
-          part.get("text", "") for part in content if isinstance(part, dict)
-        )
-
-      content = str(content).strip()
-      start = content.find("{")
-      end = content.rfind("}")
-
-      if start == -1 or end < start:
-        raise ValueError(f"invalid verifier JSON: {content!r}")
-
-      verdict = json.loads(content[start:end + 1])
-      return VerificationResult(verdict.get("matches") is True)
-
-    except HTTPError as error:
-      body = error.read().decode("utf-8", errors="replace")
-      message = f"HTTP {error.code}: {body}"
-    except Exception as error:
-      message = str(error)
-
-    return VerificationResult(not self.config.fail_closed, message)
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +289,8 @@ def score_records(records: list[dict[str, Any]], iou_threshold: float) -> dict[s
   size_matches = {"small": 0, "medium": 0, "large": 0}
   count_errors: list[float] = []
   detector_latencies: list[float] = []
-  verifier_latencies: list[float] = []
   total_latencies: list[float] = []
   model_errors = 0
-  verifier_errors = 0
 
   for record in records:
     gt_boxes = [tuple(float(value) for value in box) for box in record["gt_boxes"]]
@@ -404,9 +304,7 @@ def score_records(records: list[dict[str, Any]], iou_threshold: float) -> dict[s
     matched_gt = {match[1] for match in matches}
 
     detector_latencies.append(float(record.get("detector_latency_ms", 0.0)))
-    verifier_latencies.append(float(record.get("verifier_latency_ms", 0.0)))
     total_latencies.append(float(record.get("total_latency_ms", 0.0)))
-    verifier_errors += int(record.get("verifier_error_count", 0))
     count_errors.append(abs(len(predicted_boxes) - len(gt_boxes)))
 
     if has_error:
@@ -509,10 +407,8 @@ def score_records(records: list[dict[str, Any]], iou_threshold: float) -> dict[s
     "count_mae": _safe_divide(sum(count_errors), len(count_errors)),
     "model_errors": model_errors,
     "model_error_rate": _safe_divide(model_errors, len(records)),
-    "verifier_errors": verifier_errors,
     "latency_ms": {
       "detector_mean": _safe_divide(sum(detector_latencies), len(detector_latencies)),
-      "verifier_mean": _safe_divide(sum(verifier_latencies), len(verifier_latencies)),
       "total_mean": _safe_divide(sum(total_latencies), len(total_latencies)),
       "total_p50": _percentile(total_latencies, 0.50),
       "total_p95": _percentile(total_latencies, 0.95),
@@ -659,7 +555,6 @@ def _append_summary_csv(path: Path, summary: dict[str, Any]) -> None:
     "count_mae": summary["metrics"]["count_mae"],
     "model_error_rate": summary["metrics"]["model_error_rate"],
     "detector_latency_mean_ms": summary["metrics"]["latency_ms"]["detector_mean"],
-    "verifier_latency_mean_ms": summary["metrics"]["latency_ms"]["verifier_mean"],
     "total_latency_p50_ms": summary["metrics"]["latency_ms"]["total_p50"],
     "total_latency_p95_ms": summary["metrics"]["latency_ms"]["total_p95"],
     "throughput_samples_per_second": summary["metrics"]["inference_throughput_samples_per_second"],
@@ -678,7 +573,10 @@ def _append_summary_csv(path: Path, summary: dict[str, Any]) -> None:
   with temporary_path.open("w", newline="", encoding="utf-8") as handle:
     writer = csv.DictWriter(handle, fieldnames=list(row))
     writer.writeheader()
-    writer.writerows(existing_rows)
+    writer.writerows(
+      {field: existing.get(field, "") for field in row}
+      for existing in existing_rows
+    )
     writer.writerow(row)
 
   temporary_path.replace(path)
@@ -701,12 +599,7 @@ def _selected_model_options(config: BenchmarkConfig) -> dict[str, Any]:
 
 
 def _run_label(config: BenchmarkConfig) -> str:
-  label = config.model_name.strip().lower()
-
-  if config.verifier.enabled:
-    label += "+qwen-verifier"
-
-  return label
+  return config.model_name.strip().lower()
 
 
 def _prepare_run_directory(config: BenchmarkConfig) -> tuple[str, Path]:
@@ -783,7 +676,6 @@ def run_benchmark(config: BenchmarkConfig = CONFIG) -> dict[str, Any]:
     options=_selected_model_options(config),
     threshold=config.model_threshold,
   )
-  verifier = QwenBBoxVerifier(config.verifier) if config.verifier.enabled else None
   load_start = time.perf_counter()
   detector.load_model()
   detector.synchronize()
@@ -803,11 +695,8 @@ def run_benchmark(config: BenchmarkConfig = CONFIG) -> dict[str, Any]:
     with predictions_path.open("a", encoding="utf-8") as predictions_file:
       for completed, sample in enumerate(pending_samples, start=1):
         detector_latency_ms = 0.0
-        verifier_latency_ms = 0.0
-        verifier_error_count = 0
         error_message = None
         raw_detections: list[Detection] = []
-        accepted_detections: list[Detection] = []
         image = None
 
         try:
@@ -825,27 +714,13 @@ def run_benchmark(config: BenchmarkConfig = CONFIG) -> dict[str, Any]:
             raw_detections, image.size, config.model_threshold
           )
 
-          if verifier is None:
-            accepted_detections = raw_detections
-          else:
-            for detection in raw_detections:
-              verifier_start = time.perf_counter()
-              verification = verifier.verify(image, detection.bbox_xyxy, sample.prompt)
-              verifier_latency_ms += (time.perf_counter() - verifier_start) * 1000.0
-
-              if verification.error:
-                verifier_error_count += 1
-
-              if verification.matches:
-                accepted_detections.append(detection)
-
         except Exception as error:
           error_message = f"{type(error).__name__}: {error}"
 
           if not config.continue_on_error:
             raise
 
-        total_latency_ms = detector_latency_ms + verifier_latency_ms
+        total_latency_ms = detector_latency_ms
         record = {
           "sample_id": sample.sample_id,
           "image_id": sample.image_id,
@@ -853,11 +728,9 @@ def run_benchmark(config: BenchmarkConfig = CONFIG) -> dict[str, Any]:
           "prompt": sample.prompt,
           "gt_boxes": [list(box) for box in sample.gt_boxes],
           "raw_predictions": [_serialize_detection(item) for item in raw_detections],
-          "predictions": [_serialize_detection(item) for item in accepted_detections],
+          "predictions": [_serialize_detection(item) for item in raw_detections],
           "detector_latency_ms": detector_latency_ms,
-          "verifier_latency_ms": verifier_latency_ms,
           "total_latency_ms": total_latency_ms,
-          "verifier_error_count": verifier_error_count,
           "error": error_message,
         }
         predictions_file.write(json.dumps(record, sort_keys=True) + "\n")
@@ -880,7 +753,7 @@ def run_benchmark(config: BenchmarkConfig = CONFIG) -> dict[str, Any]:
 
         print(
           f"[{completed}/{len(pending_samples)}] {sample.sample_id} "
-          f"GT={len(sample.gt_boxes)} predicted={len(accepted_detections)} "
+          f"GT={len(sample.gt_boxes)} predicted={len(raw_detections)} "
           f"latency={total_latency_ms:.1f} ms"
         )
 

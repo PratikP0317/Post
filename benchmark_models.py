@@ -247,7 +247,7 @@ class LLMDetDetector(DetectorModel):
     import torch
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-    model_path = str(self.options.get("model_path", "iSEE-Laboratory/llmdet_tiny"))
+    model_path = str(self.options.get("model_path", "/Models/llmdet-large"))
     self.device, self.dtype = _torch_device_and_dtype(torch, self.options)
     self.processor = AutoProcessor.from_pretrained(model_path)
     self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
