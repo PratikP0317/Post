@@ -4,8 +4,7 @@ Edit ``CONFIG`` below, then run:
 
     python benchmark_refdrone.py
 
-The benchmark evaluates one detector per process and leaves ``file.py``
-independent from dataset evaluation.
+The benchmark evaluates one detector per process.
 """
 
 from __future__ import annotations
